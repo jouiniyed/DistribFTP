@@ -1,3 +1,5 @@
+![DistribFTP](assets/DistribFTP.png)
+
 # FTP Server
 
 A simple FTP-like file transfer system with a master/slave architecture, built on top of the CS:APP socket library.
