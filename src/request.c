@@ -1,44 +1,40 @@
 #include "csapp.h"
-
 #include "request.h"
 #include "filereader.h"
 
-// Q16 : liste des autres esclaves pour la propagation
 #define MAX_SLAVES 10
 static char g_slave_ips[MAX_SLAVES][64];
 static int  g_slave_ports[MAX_SLAVES];
-static int  g_nb_esclaves = 0;
+static int  g_nb_slaves = 0;
 
 void set_slaves(char ips[][64], int ports[], int nb) {
-    g_nb_esclaves = (nb < MAX_SLAVES) ? nb : MAX_SLAVES;
-    for (int i = 0; i < g_nb_esclaves; i++) {
+    g_nb_slaves = (nb < MAX_SLAVES) ? nb : MAX_SLAVES;
+    for (int i = 0; i < g_nb_slaves; i++) {
         strncpy(g_slave_ips[i], ips[i], 63);
         g_slave_ips[i][63] = '\0';
         g_slave_ports[i] = ports[i];
     }
 }
 
-// Q16 : envoie une requete RM a un autre esclave (propagation)
-static void propager_rm(char *nom, char *ip, int port) {
-    int fd = open_clientfd(ip, port); // minuscule = pas d'exit si ca marche pas
-    if (fd < 0) return; // esclave hors service, on abandonne
+static void propagate_rm(char *nom, char *ip, int port) {
+    // lowercase open_clientfd returns -1 on failure instead of exiting
+    int fd = open_clientfd(ip, port);
+    if (fd < 0) return;
 
     request_t req;
     memset(&req, 0, sizeof(request_t));
     req.type = RM;
     strncpy(req.nom, nom, 255);
     req.nom[255] = '\0';
-    req.propagate = 1; // ne pas re-propager
+    req.propagate = 1;
 
     rio_writen(fd, &req, sizeof(request_t));
 
-    // lire la reponse de l'esclave
     response_t res;
     rio_t rio;
     Rio_readinitb(&rio, fd);
     Rio_readnb(&rio, &res, sizeof(response_t));
 
-    // fermer proprement
     request_t bye;
     memset(&bye, 0, sizeof(request_t));
     bye.type = BYE;
@@ -47,8 +43,7 @@ static void propager_rm(char *nom, char *ip, int port) {
     Close(fd);
 }
 
-// Q16 : envoie un fichier PUT a un autre esclave (propagation)
-static void propager_put(char *nom, char *ip, int port) {
+static void propagate_put(char *nom, char *ip, int port) {
     int fd = open_clientfd(ip, port);
     if (fd < 0) return;
 
@@ -61,7 +56,6 @@ static void propager_put(char *nom, char *ip, int port) {
 
     rio_writen(fd, &req, sizeof(request_t));
 
-    // attendre que l'esclave soit pret
     response_t res;
     rio_t rio;
     Rio_readinitb(&rio, fd);
@@ -71,7 +65,6 @@ static void propager_put(char *nom, char *ip, int port) {
         return;
     }
 
-    // ouvrir le fichier local et l'envoyer par blocs
     char path[512];
     strcpy(path, "dirServer/");
     strcat(path, nom);
@@ -92,13 +85,12 @@ static void propager_put(char *nom, char *ip, int port) {
     size_t sent = 0;
     while (sent < nb_blocs) {
         n = Rio_readn(ffd, buf, 512);
-        if (n < 512) memset(buf + n, 0, 512 - n); // rembourrage du dernier bloc
+        if (n < 512) memset(buf + n, 0, 512 - n);
         rio_writen(fd, buf, 512);
         sent++;
     }
     close(ffd);
 
-    // fermer proprement
     request_t bye;
     memset(&bye, 0, sizeof(request_t));
     bye.type = BYE;
@@ -107,8 +99,8 @@ static void propager_put(char *nom, char *ip, int port) {
     Close(fd);
 }
 
-request_t* init_request(typereq_t type, char nom[256]){
-    request_t *r = (request_t *) calloc(1, sizeof(request_t));
+request_t* init_request(typereq_t type, char nom[256]) {
+    request_t *r = (request_t *)calloc(1, sizeof(request_t));
     if (!r) return NULL;
 
     r->type = type;
@@ -120,25 +112,25 @@ request_t* init_request(typereq_t type, char nom[256]){
     return r;
 }
 
-void setType(request_t *r, typereq_t t){ if(r != NULL) r->type = t;}
+void setType(request_t *r, typereq_t t) { if (r != NULL) r->type = t; }
 
-void setNom(request_t *r, char *nom){
-    if(r == NULL || nom == NULL) return;
+void setNom(request_t *r, char *nom) {
+    if (r == NULL || nom == NULL) return;
     strncpy(r->nom, nom, 255);
     r->nom[255] = '\0';
 }
 
-typereq_t getType(request_t *r){ 
-    if(r != NULL) return r->type;
+typereq_t getType(request_t *r) {
+    if (r != NULL) return r->type;
     return UNKNOWN;
 }
 
-char* getNom(request_t *r){ 
-    if(r != NULL) return r->nom;
+char* getNom(request_t *r) {
+    if (r != NULL) return r->nom;
     return NULL;
 }
 
-response_t requestHandler(int connfd){
+response_t requestHandler(int connfd) {
     ssize_t n;
     rio_t rio;
     request_t req;
@@ -146,31 +138,22 @@ response_t requestHandler(int connfd){
 
     Rio_readinitb(&rio, connfd);
 
-    // boucle jusqu'à BYE ou déconnexion
     while ((n = Rio_readnb(&rio, &req, sizeof(request_t))) > 0) {
         if (req.type == GET) {
-            // Q10 : on passe l'offset pour que le serveur reprenne au bon bloc si besoin
             res = filereader(connfd, getNom(&req), req.offset);
         } else if (req.type == LS) {
-            // Q15 : lister le contenu du repertoire serveur
             res = filels(connfd);
         } else if (req.type == RM) {
-            // Q16 : supprimer un fichier sur le serveur
             res = filerm(connfd, getNom(&req));
             if (res.code == SUCCES && req.propagate == 0) {
-                // propager la suppression aux autres esclaves
-                for (int i = 0; i < g_nb_esclaves; i++) {
-                    propager_rm(getNom(&req), g_slave_ips[i], g_slave_ports[i]);
-                }
+                for (int i = 0; i < g_nb_slaves; i++)
+                    propagate_rm(getNom(&req), g_slave_ips[i], g_slave_ports[i]);
             }
         } else if (req.type == PUT) {
-            // Q16 : recevoir un fichier du client
             res = fileput(connfd, getNom(&req), &rio);
             if (res.code == SUCCES && req.propagate == 0) {
-                // propager le fichier aux autres esclaves
-                for (int i = 0; i < g_nb_esclaves; i++) {
-                    propager_put(getNom(&req), g_slave_ips[i], g_slave_ports[i]);
-                }
+                for (int i = 0; i < g_nb_slaves; i++)
+                    propagate_put(getNom(&req), g_slave_ips[i], g_slave_ports[i]);
             }
         } else if (req.type == BYE) {
             res.code = SUCCES;

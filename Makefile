@@ -2,39 +2,34 @@
 
 .SUFFIXES:
 
-CC = gcc
-CFLAGS = -Wall -Werror
-LIBS += -lpthread
-INCLDIR = -I.
+CC      = gcc
+CFLAGS  = -Wall -Werror
+LIBS   += -lpthread
+INCLDIR = -Iinclude
 
-# Tous les fichiers .c
-SRCS = $(wildcard *.c)
+SRCS = $(wildcard src/*.c)
+OBJS = $(SRCS:src/%.c=src/%.o)
 
-# Tous les objets
-OBJS = $(SRCS:.c=.o)
-
-# Exécutables
 PROGS = ftpserveri ftpclient ftpmaster ftpslave
 
-# Exclure les fichiers contenant main
-COMMON_OBJS = $(filter-out ftpserveri.o ftpclient.o ftpmaster.o ftpslave.o,$(OBJS))
+COMMON_OBJS = $(filter-out src/ftpserveri.o src/ftpclient.o src/ftpmaster.o src/ftpslave.o,$(OBJS))
 
 all: $(PROGS)
 
-ftpserveri: ftpserveri.o $(COMMON_OBJS)
+ftpserveri: src/ftpserveri.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LIBS)
 
-ftpclient: ftpclient.o $(COMMON_OBJS)
+ftpclient: src/ftpclient.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LIBS)
 
-ftpmaster: ftpmaster.o $(COMMON_OBJS)
+ftpmaster: src/ftpmaster.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LIBS)
 
-ftpslave: ftpslave.o $(COMMON_OBJS)
+ftpslave: src/ftpslave.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LIBS)
 
-%.o: %.c
+src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(INCLDIR) -c -o $@ $<
 
 clean:
-	rm -f $(PROGS) *.o
+	rm -f $(PROGS) src/*.o

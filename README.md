@@ -1,118 +1,99 @@
-# Rapport — Projet FTP
+# FTP Server
 
-## 1. Architecture générale
+A simple FTP-like file transfer system with a master/slave architecture, built on top of the CS:APP socket library.
 
-Le système comporte trois entités : un **client** (`ftpclient`), un **maître** (`ftpmaster`) et un ou plusieurs **esclaves** (`ftpslave`).
+## Architecture
+
+Three processes work together:
 
 ```
 ftpclient
     |
-    |-- (1) connect port 2121 --> ftpmaster
-    |<-- slave_addr_t (ip+port) --
+    |-- connect port 2121 --> ftpmaster
+    |<-- slave_addr_t (ip + port) --
     |-- close --
     |
-    |-- (2) connect port 2122 --> ftpslave
-    |-- request_t (GET/LS/BYE) ->
-    |<-- response_t + données ---
+    |-- connect port slave_port --> ftpslave
+    |-- request_t (GET / PUT / LS / RM / BYE) -->
+    |<-- response_t + data ---
     |-- close --
 ```
 
-Le maître ne fait que rediriger : il reçoit un client, lui envoie l'adresse d'un esclave disponible, puis ferme la connexion. Le client se connecte ensuite directement à l'esclave pour le vrai travail.
+**ftpmaster** sits on port 2121. When a client connects, it picks an available slave using round-robin, sends its address, then closes. The client then talks directly to the slave.
 
-Les esclaves utilisent un pool de 10 processus pré-forkés. Chaque fils tourne en boucle et appelle `Accept()` pour prendre en charge les clients.
+**ftpslave** runs a pool of 10 pre-forked worker processes. Each worker loops on `Accept()` to handle clients. Additional slaves can be passed as arguments; writes (PUT/RM) are propagated to all of them.
 
----
+**ftpserveri** is a standalone single-node version with the same worker pool, no master required.
 
-## 2. Protocole
+## Wire Protocol
 
-Tous les échanges utilisent des structures binaires transmises avec `Rio_writen` / `Rio_readnb`.
+All messages are fixed-size binary structs sent with `Rio_writen` / `Rio_readnb`.
 
-**request_t** (client → esclave)
-```
-| typereq_t type | char nom[256] | size_t offset | int propagate |
-```
-- `type` : GET, PUT, LS, RM ou BYE
-- `nom` : nom du fichier
-- `offset` : blocs déjà reçus, 0 si nouveau téléchargement (Q10)
-- `propagate` : 1 = ne pas re-propager (déjà propagé), 0 = propager aux autres esclaves (Q16)
+**`request_t`** (client → slave)
 
-**response_t** (esclave → client)
-```
-| codeRetour code |   (SUCCES ou ERREUR)
-```
+| Field | Type | Description |
+|---|---|---|
+| `type` | `typereq_t` | GET, PUT, LS, RM, or BYE |
+| `nom` | `char[256]` | filename |
+| `offset` | `size_t` | blocks already received (0 = fresh download) |
+| `propagate` | `int` | 1 = already propagated, skip; 0 = forward to peers |
 
-**slave_addr_t** (maître → client)
-```
-| char ip[64] | int port |   (port=0 si aucun esclave dispo)
-```
+**`response_t`** (slave → client): a single `codeRetour` field — `SUCCES` or `ERREUR`.
 
-### Séquence GET complète
+**`slave_addr_t`** (master → client): `char ip[64]` + `int port`. Port 0 means no slave available.
+
+### GET sequence
 
 ```
-client                      esclave
-  |-- request_t (GET, offset=0) -->|
-  |<-- response_t (SUCCES) --------|
-  |<-- size_t nb_blocs ------------|
-  |<-- bloc[0..nb_blocs] (512B) ---|  x nb_blocs
+client                          slave
+  |-- request_t (GET, offset) -->|
+  |<-- response_t (SUCCES) ------|
+  |<-- size_t nb_blocks ---------|
+  |<-- block[0..n] (512 B each) -|
 ```
 
-### Séquence LS
+### PUT sequence
 
 ```
-client                      esclave
-  |-- request_t (LS) ------------>|
-  |<-- response_t (SUCCES) -------|
-  |<-- size_t n ------------------|
-  |<-- char buf[n] ---------------|   (noms séparés par \n)
+client                          slave
+  |-- request_t (PUT) ---------->|
+  |<-- response_t (SUCCES) ------|
+  |-- size_t nb_blocks ---------->|
+  |-- block[0..n] (512 B each) -->|
 ```
 
-### Séquence RM (Q16)
+### LS / RM
 
-```
-client                      esclave
-  |-- request_t (RM, nom) ------->|
-  |<-- response_t (SUCCES/ERREUR)-|
-```
+LS returns `response_t`, then `size_t n`, then `n` bytes of newline-separated filenames.
+RM returns `response_t` only.
 
-### Séquence PUT (Q16)
+After a successful PUT or RM, the slave forwards the same request (with `propagate=1`) to all its peers.
 
-```
-client                      esclave
-  |-- request_t (PUT, nom) ------>|
-  |<-- response_t (SUCCES) -------|
-  |-- size_t nb_blocs ----------->|
-  |-- bloc[0..nb_blocs] (512B) -->|  x nb_blocs
-```
+## Commands
 
-Après un PUT ou RM réussi, l'esclave propage la même opération aux autres esclaves connus (avec `propagate=1` pour éviter une boucle).
+| Command | Description |
+|---|---|
+| `get <file>` | Download a file from the server into `dirClient/` |
+| `put <file>` | Upload `dirClient/<file>` to the server |
+| `rm <file>` | Delete a file on the server |
+| `ls` | List files in the server's `dirServer/` |
+| `bye` | Close the session |
 
----
-
-## 3. Reprise sur crash (Q10)
-
-Après chaque bloc reçu, le client écrit un fichier `.nom.prog` dans `dirClient/` contenant le nombre de blocs reçus (`size_t`). Au relancement, il lit cet offset et l'envoie dans la requête. Le serveur fait `lseek(fd, offset * 512, SEEK_SET)` pour sauter les blocs déjà envoyés. Le fichier `.prog` est supprimé quand le transfert est fini.
-
----
-
-## 4. Détection de panne (Q14)
-
-Le maître vérifie si un esclave répond avant de l'assigner, via une tentative de connexion TCP (`open_clientfd` minuscule, retourne -1 sans `exit`). Si l'esclave tombe pendant un transfert, le client détecte l'erreur via `rio_writen` (retourne -1), se reconnecte au maître, obtient un nouvel esclave, et renvoie la même requête avec l'offset courant.
-
-`SIGPIPE` est ignoré (`SIG_IGN`) dans le client et les fils esclaves pour ne pas mourir sur une connexion coupée.
-
----
-
-## 5. Compilation et test
-
-### Compilation
+## Build
 
 ```bash
 make
 ```
 
-Produit : `ftpclient`, `ftpmaster`, `ftpslave`.
+Produces: `ftpclient`, `ftpmaster`, `ftpslave`, `ftpserveri`.
 
-### Test étape 1 — serveur simple (sans maître)
+```bash
+make clean
+```
+
+## Usage
+
+### Standalone server
 
 ```bash
 # Terminal 1
@@ -121,75 +102,53 @@ Produit : `ftpclient`, `ftpmaster`, `ftpslave`.
 # Terminal 2
 ./ftpclient localhost
 get lorem.txt
+ls
 bye
 ```
 
-### Test étape 3 — architecture maître/esclave
+### Master/slave setup
 
 ```bash
-# Terminal 1 — lancer l'esclave
+# Terminal 1 — slave
 ./ftpslave 2122
 
-# Terminal 2 — lancer le maître (lui passer l'adresse de l'esclave)
+# Terminal 2 — master (tell it where the slave is)
 ./ftpmaster localhost 2122
 
 # Terminal 3 — client
 ./ftpclient localhost
 get lorem.txt
-ls
 bye
 ```
 
-### Test reprise sur crash (Q10)
+### Two slaves with propagation
 
 ```bash
-# Lancer le client, démarrer un get d'un gros fichier
-./ftpclient localhost
-get gros.bin
-# Pendant le transfert, faire Ctrl+C
-# Relancer le client : le transfert reprend depuis le dernier bloc
-./ftpclient localhost
-get gros.bin
-```
-
-### Ports utilisés
-
-| Processus | Port |
-|---|---|
-| ftpmaster | 2121 |
-| ftpslave  | 2122 (modifiable via argv) |
-
-### Test Q16 — rm et put (serveur simple)
-
-```bash
-# Terminal 1 — lancer le serveur
-./ftpserveri
-
-# Terminal 2 — client
-./ftpclient localhost
-ls                    # lister les fichiers du serveur
-put mon_fichier.txt   # envoyer dirClient/mon_fichier.txt vers dirServer/
-ls                    # vérifier qu'il est arrivé
-rm mon_fichier.txt    # supprimer le fichier sur le serveur
-ls                    # vérifier que c'est supprimé
-bye
-```
-
-### Test Q16 — propagation rm/put (2 esclaves)
-
-```bash
-# Terminal 1 — esclave 1 (propagation vers esclave 2)
+# Terminal 1
 ./ftpslave 2122 localhost 2123
 
-# Terminal 2 — esclave 2 (propagation vers esclave 1)
+# Terminal 2
 ./ftpslave 2123 localhost 2122
 
-# Terminal 3 — maître (NB_SLAVES = 2 dans ftpmaster.c)
+# Terminal 3 — master must know NB_SLAVES=2 (set in ftpmaster.c)
 ./ftpmaster localhost 2122 localhost 2123
 
-# Terminal 4 — client
+# Terminal 4
 ./ftpclient localhost
-put mon_fichier.txt   # esclave 1 reçoit et propage automatiquement à esclave 2
-rm mon_fichier.txt    # idem, suppression propagée
+put myfile.txt   # uploaded to slave 1, auto-propagated to slave 2
+rm myfile.txt    # deleted on slave 1, auto-propagated to slave 2
 bye
 ```
+
+### Crash recovery
+
+If a GET is interrupted (Ctrl-C), a `.prog` file records how many 512-byte blocks were received. Re-running the same `get` command resumes from that block. The `.prog` file is deleted once the transfer completes.
+
+If the slave dies mid-transfer, the client detects the broken write, reconnects to the master, gets a new slave address, and retries with the current offset.
+
+### Ports
+
+| Process | Port |
+|---|---|
+| ftpmaster | 2121 |
+| ftpslave | 2122 (overridable via argv) |
